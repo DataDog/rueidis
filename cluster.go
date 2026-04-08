@@ -3,8 +3,10 @@ package rueidis
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,22 @@ import (
 
 // ErrNoSlot indicates that there is no redis node owning the key slot.
 var ErrNoSlot = errors.New("the slot has no redis node")
+
+// rlog writes a timestamped JSON log to stderr for debugging cluster operations.
+func rlog(format string, args ...any) {
+	ts := time.Now().UTC().Format("2006-01-02T15:04:05.000000+00:00")
+	fmt.Fprintf(os.Stderr, `{"ts":"%s",`+format[1:]+"\n", append([]any{ts}, args...)...)
+}
+
+// isValidRedisAddr returns true if the address has a resolvable hostname (not empty or "?").
+func isValidRedisAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return host != "" && host != "?"
+}
+
 var ErrReplicaOnlyConflict = errors.New("ReplicaOnly conflicts with SendToReplicas option")
 var ErrInvalidShardsRefreshInterval = errors.New("ShardsRefreshInterval must be greater than or equal to 0")
 var ErrReplicaOnlyConflictWithReplicaSelector = errors.New("ReplicaOnly conflicts with ReplicaSelector option")
@@ -24,20 +42,21 @@ var ErrReplicaSelectorConflictWithReadNodeSelector = errors.New("either set Repl
 var ErrSendToReplicasNotSet = errors.New("SendToReplicas must be set when ReplicaSelector is set")
 
 type clusterClient struct {
-	wslots       [16384]conn
-	retryHandler retryHandler
-	opt          *ClientOption
-	rOpt         *ClientOption
-	conns        map[string]connrole
-	connFn       connFn
-	stopCh       chan struct{}
-	sc           call
-	rslots       [][]NodeInfo
-	mu           sync.RWMutex
-	stop         uint32
-	cmd          Builder
-	retry        bool
-	hasLftm      bool
+	wslots         [16384]conn
+	retryHandler   retryHandler
+	opt            *ClientOption
+	rOpt           *ClientOption
+	conns          map[string]connrole
+	connFn         connFn
+	stopCh         chan struct{}
+	sc             call
+	rslots         [][]NodeInfo
+	mu             sync.RWMutex
+	stop           uint32
+	cmd            Builder
+	retry          bool
+	hasLftm        bool
+	errNoSlotCount int64
 }
 
 // NOTE: connrole and conn must be initialized at the same time
@@ -91,6 +110,7 @@ func newClusterClient(opt *ClientOption, connFn connFn, retryer retryHandler) (*
 	client.connFn = func(dst string, opt *ClientOption) conn {
 		cc := connFn(dst, opt)
 		cc.SetOnCloseHook(func(err error) {
+			rlog(`{"level":"WARN","logger":"rueidis","msg":"conn close hook fired","addr":"%s","err":"%v"}`+"\n", dst, err)
 			client.lazyRefresh()
 		})
 		return cc
@@ -186,17 +206,30 @@ func getClusterSlots(c conn, timeout time.Duration) clusterslots {
 }
 
 func (c *clusterClient) _refresh() (err error) {
+	suppressed := c.sc.suppressing()
 	c.mu.RLock()
 	results := make(chan clusterslots, len(c.conns))
 	pending := make([]conn, 0, len(c.conns))
-	for _, cc := range c.conns {
+	pendingAddrs := make([]string, 0, len(c.conns))
+	for addr, cc := range c.conns {
 		pending = append(pending, cc.conn)
+		pendingAddrs = append(pendingAddrs, addr)
 	}
+	prevConnsCount := len(c.conns)
 	c.mu.RUnlock()
 
+	if suppressed > 1 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh entry with contention","prev_conns":%d,"prev_addrs":"%v","singleflight_suppressed":%d}`+"\n",
+			prevConnsCount, pendingAddrs, suppressed)
+	}
+
 	var result clusterslots
+	var bestResult clusterslots
+	var bestCoverage int64
+	queriedCount := 0
+	var lastErr error
 	for i := 0; i < cap(results); i++ {
-		if i&3 == 0 { // batch CLUSTER SLOTS/CLUSTER SHARDS for every 4 connections
+		if i&3 == 0 {
 			for j := i; j < i+4 && j < len(pending); j++ {
 				go func(c conn, timeout time.Duration) {
 					results <- getClusterSlots(c, timeout)
@@ -204,17 +237,63 @@ func (c *clusterClient) _refresh() (err error) {
 			}
 		}
 		result = <-results
-		err = result.reply.Error()
+		queriedCount++
+		if e := result.reply.Error(); e != nil {
+			lastErr = e
+			err = e
+		} else {
+			err = nil
+		}
 		if len(result.reply.val.values()) != 0 {
-			break
+			// Count slot coverage using parse() which handles both CLUSTER SLOTS and CLUSTER SHARDS
+			var coverage int64
+			for _, g := range result.parse(c.opt.TLSConfig != nil) {
+				for _, slot := range g.slots {
+					coverage += slot[1] - slot[0] + 1
+				}
+			}
+			if coverage >= 16384 {
+				bestResult = result
+				bestCoverage = coverage
+				break // complete topology found
+			}
+			if coverage > bestCoverage {
+				bestResult = result
+				bestCoverage = coverage
+			}
 		}
 	}
+	if bestCoverage > 0 {
+		result = bestResult
+		err = nil
+	}
+	if bestCoverage > 0 && bestCoverage < 16384 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: best response incomplete","source":"%s","slots_covered":%d,"queried":%d,"prev_conns":%d}`+"\n",
+			result.addr, bestCoverage, queriedCount, prevConnsCount)
+	}
 	if err != nil {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: all queries failed","prev_conns":%d,"queried":%d,"last_err":"%v","pending_count":%d}`+"\n",
+			prevConnsCount, queriedCount, lastErr, len(pendingAddrs))
 		return err
 	}
 	pending = nil
 
 	groups := result.parse(c.opt.TLSConfig != nil)
+
+	totalSlotsCovered := 0
+	for _, g := range groups {
+		for _, slot := range g.slots {
+			totalSlotsCovered += int(slot[1] - slot[0] + 1)
+		}
+	}
+	if totalSlotsCovered < 16384 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: incomplete topology","source":"%s","groups":%d,"slots_covered":%d,"prev_conns":%d,"last_err":"%v"}`+"\n",
+			result.addr, len(groups), totalSlotsCovered, prevConnsCount, lastErr)
+	}
+	if len(groups) == 0 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: empty groups - skipping swap","prev_conns":%d}`+"\n", prevConnsCount)
+		return nil
+	}
 	conns := make(map[string]connrole, len(groups))
 	for master, g := range groups {
 		conns[master] = connrole{conn: c.connFn(master, c.opt)}
@@ -239,17 +318,39 @@ func (c *clusterClient) _refresh() (err error) {
 	}
 
 	var removes []conn
+	var reusedAddrs []string
+	var removedAddrs []string
 
 	c.mu.RLock()
 	for addr, cc := range c.conns {
 		if fresh, ok := conns[addr]; ok {
 			fresh.conn = cc.conn
 			conns[addr] = fresh
+			reusedAddrs = append(reusedAddrs, addr)
 		} else {
 			removes = append(removes, cc.conn)
+			removedAddrs = append(removedAddrs, addr)
 		}
 	}
 	c.mu.RUnlock()
+
+	newAddrs := make([]string, 0)
+	for addr := range conns {
+		found := false
+		for _, r := range reusedAddrs {
+			if r == addr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			newAddrs = append(newAddrs, addr)
+		}
+	}
+	if len(newAddrs) > 0 || len(removedAddrs) > 0 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh topology changed","reused":%d,"new":%d,"new_addrs":"%v","removed":%d,"removed_addrs":"%v"}`+"\n",
+			len(reusedAddrs), len(newAddrs), newAddrs, len(removedAddrs), removedAddrs)
+	}
 
 	wslots := [16384]conn{}
 	var rslots [][]NodeInfo
@@ -321,19 +422,63 @@ func (c *clusterClient) _refresh() (err error) {
 		}
 	}
 
+	newAssigned := 0
+	nilConnsInSlots := 0
+	for i := 0; i < 16384; i++ {
+		if wslots[i] != nil {
+			newAssigned++
+		} else {
+			nilConnsInSlots++
+		}
+	}
+
+	if newAssigned < 16384 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: incomplete slot assignment","new_assigned":%d,"nil_slots":%d,"groups":%d,"new_conns":%d}`+"\n",
+			newAssigned, nilConnsInSlots, len(groups), len(conns))
+	}
+
+	if newAssigned == 0 {
+		rlog(`{"level":"ERROR","logger":"rueidis","msg":"_refresh: ZERO SLOTS ASSIGNED - skipping swap","groups":%d,"source":"%s","prev_conns":%d,"new_conns":%d}`+"\n",
+			len(groups), result.addr, prevConnsCount, len(conns))
+		return nil
+	}
+
 	c.mu.Lock()
+	prevAssigned := 0
+	for i := 0; i < 16384; i++ {
+		if c.wslots[i] != nil {
+			prevAssigned++
+		}
+	}
+	if newAssigned < prevAssigned {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"_refresh: SLOT COVERAGE DROP - skipping swap","prev_assigned":%d,"new_assigned":%d,"groups":%d,"source":"%s","prev_conns":%d,"new_conns":%d}`+"\n",
+			prevAssigned, newAssigned, len(groups), result.addr, prevConnsCount, len(conns))
+		c.mu.Unlock()
+		return nil
+	}
 	c.wslots = wslots
 	c.rslots = rslots
 	c.conns = conns
 	c.mu.Unlock()
 
+	if len(removes) > 0 || newAssigned < 16384 || len(conns) != prevConnsCount {
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"_refresh complete","final_conns":%d,"final_assigned":%d,"removed":%d,"prev_conns":%d}`+"\n",
+			len(conns), newAssigned, len(removes), prevConnsCount)
+	}
+
 	if len(removes) > 0 {
-		go func(removes []conn) {
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"_refresh: scheduling old conn close","removed_count":%d,"removed_addrs":"%v","delay_ms":5000,"new_assigned":%d,"total_slots_covered":%d}`,
+			len(removes), removedAddrs, newAssigned, totalSlotsCovered)
+		go func(removes []conn, addrs []string) {
 			time.Sleep(time.Second * 5)
+			rlog(`{"level":"INFO","logger":"rueidis","msg":"_refresh: closing old conns NOW (5s delay elapsed)","count":%d,"addrs":"%v"}`,
+				len(removes), addrs)
 			for _, cc := range removes {
 				cc.Close()
 			}
-		}(removes)
+			rlog(`{"level":"INFO","logger":"rueidis","msg":"_refresh: old conn close complete","closed":%d}`,
+				len(removes))
+		}(removes, removedAddrs)
 	}
 
 	return nil
@@ -399,6 +544,9 @@ func parseSlots(slots RedisMessage, defaultAddr string) map[string]group {
 // defaultAddr is needed in case the node does not know its own IP
 func parseShards(shards RedisMessage, defaultAddr string, tls bool) map[string]group {
 	groups := make(map[string]group, len(shards.values()))
+	totalShards := len(shards.values())
+	skippedNodes := 0
+	droppedShards := 0
 	for _, v := range shards.values() {
 		m := -1
 		shard, _ := v.AsMap()
@@ -416,16 +564,23 @@ func parseShards(shards RedisMessage, defaultAddr string, tls bool) map[string]g
 		}
 		for _, n := range _nodes {
 			dict, _ := n.AsMap()
-			if dictHealth := dict["health"]; dictHealth.string() != "online" {
+			dictHealth := dict["health"]
+			dictRole := dict["role"]
+			dictEndpoint := dict["endpoint"]
+			health := dictHealth.string()
+			role := dictRole.string()
+			endpoint := dictEndpoint.string()
+			if health != "online" {
+				rlog(`{"level":"WARN","logger":"rueidis","msg":"parseShards: skipping node","health":"%s","role":"%s","endpoint":"%s"}`+"\n", health, role, endpoint)
+				skippedNodes++
 				continue
 			}
 			port := dict["port"].intlen
 			if tls && dict["tls-port"].intlen > 0 {
 				port = dict["tls-port"].intlen
 			}
-			dictEndpoint := dict["endpoint"]
-			if dst := parseEndpoint(defaultAddr, dictEndpoint.string(), port); dst != "" {
-				if dictRole := dict["role"]; dictRole.string() == "master" {
+			if dst := parseEndpoint(defaultAddr, endpoint, port); dst != "" {
+				if role == "master" {
 					m = len(g.nodes)
 				}
 				g.nodes = append(g.nodes, NodeInfo{Addr: dst})
@@ -434,7 +589,14 @@ func parseShards(shards RedisMessage, defaultAddr string, tls bool) map[string]g
 		if m >= 0 {
 			g.nodes[0], g.nodes[m] = g.nodes[m], g.nodes[0]
 			groups[g.nodes[0].Addr] = g
+		} else {
+			droppedShards++
+			rlog(`{"level":"WARN","logger":"rueidis","msg":"parseShards: shard dropped (no master)","nodes_in_shard":%d,"slots":%v}`+"\n", len(g.nodes), g.slots)
 		}
+	}
+	if skippedNodes > 0 || droppedShards > 0 {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"parseShards summary","total_shards":%d,"groups_created":%d,"skipped_nodes":%d,"dropped_shards":%d}`+"\n",
+			totalShards, len(groups), skippedNodes, droppedShards)
 	}
 	return groups
 }
@@ -483,21 +645,53 @@ func (c *clusterClient) pick(ctx context.Context, slot uint16, toReplica bool) (
 			return nil, err
 		}
 		if p = c._pick(slot, toReplica); p == nil {
+			count := atomic.AddInt64(&c.errNoSlotCount, 1)
+			if count == 1 || count%1000 == 0 {
+				c.mu.RLock()
+				connsCount := len(c.conns)
+				connsAddrs := make([]string, 0, connsCount)
+				for addr := range c.conns {
+					connsAddrs = append(connsAddrs, addr)
+				}
+				nilSlots := 0
+				assignedSlots := 0
+				for i := 0; i < 16384; i++ {
+					if c.wslots[i] == nil {
+						nilSlots++
+					} else {
+						assignedSlots++
+					}
+				}
+				c.mu.RUnlock()
+				rlog(`{"level":"ERROR","logger":"rueidis","msg":"ErrNoSlot returned","slot":%d,"to_replica":%t,"conns_count":%d,"conns_addrs":"%v","wslots_nil":%d,"wslots_assigned":%d,"total_errnoSlot":%d}`+"\n",
+					slot, toReplica, connsCount, connsAddrs, nilSlots, assignedSlots, count)
+			}
 			return nil, ErrNoSlot
 		}
 	}
+	atomic.StoreInt64(&c.errNoSlotCount, 0)
 	return p, nil
 }
 
 func (c *clusterClient) redirectOrNew(addr string, prev conn, slot uint16, mode RedirectMode) conn {
+	prevAddr := prev.Addr()
+	modeStr := "MOVE"
+	if mode == RedirectAsk {
+		modeStr = "ASK"
+	}
+
 	c.mu.RLock()
 	cc := c.conns[addr]
 	c.mu.RUnlock()
 	if cc.conn != nil && prev != cc.conn {
+		rlog(`{"level":"DEBUG","logger":"rueidis","msg":"redirectOrNew: reuse existing conn","addr":"%s","slot":%d,"mode":"%s","prev_addr":"%s"}`,
+			addr, slot, modeStr, prevAddr)
 		return cc.conn
 	}
 	c.mu.Lock()
 	if cc = c.conns[addr]; cc.conn == nil {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"redirectOrNew: creating NEW conn","addr":"%s","slot":%d,"mode":"%s","prev_addr":"%s","valid_addr":%t}`,
+			addr, slot, modeStr, prevAddr, isValidRedisAddr(addr))
 		p := c.connFn(addr, c.opt)
 		cc = connrole{conn: p}
 		c.conns[addr] = cc
@@ -505,19 +699,23 @@ func (c *clusterClient) redirectOrNew(addr string, prev conn, slot uint16, mode 
 			c.wslots[slot] = p
 		}
 	} else if prev == cc.conn {
-		// try reconnection if the MOVED redirects to the same host,
-		// because the same hostname may actually be resolved into another destination
-		// depending on the fail-over implementation. ex: AWS MemoryDB's resize process.
-		go func(prev conn) {
+		rlog(`{"level":"WARN","logger":"rueidis","msg":"redirectOrNew: SAME-HOST RECONNECT (prev==cc.conn) - spawning 5s delayed close","addr":"%s","slot":%d,"mode":"%s","prev_addr":"%s","valid_addr":%t}`,
+			addr, slot, modeStr, prevAddr, isValidRedisAddr(addr))
+		go func(prev conn, addr string, slot uint16) {
 			time.Sleep(time.Second * 5)
+			rlog(`{"level":"WARN","logger":"rueidis","msg":"redirectOrNew: 5s delayed close FIRING","addr":"%s","slot":%d}`,
+				addr, slot)
 			prev.Close()
-		}(prev)
+		}(prev, addr, slot)
 		p := c.connFn(addr, c.opt)
 		cc = connrole{conn: p}
 		c.conns[addr] = cc
-		if mode == RedirectMove && slot != cmds.InitSlot { // MOVED should always point to the primary.
+		if mode == RedirectMove && slot != cmds.InitSlot {
 			c.wslots[slot] = p
 		}
+	} else {
+		rlog(`{"level":"DEBUG","logger":"rueidis","msg":"redirectOrNew: reuse (post-lock)","addr":"%s","slot":%d,"mode":"%s","prev_addr":"%s"}`,
+			addr, slot, modeStr, prevAddr)
 	}
 	c.mu.Unlock()
 	return cc.conn
@@ -542,6 +740,10 @@ retry:
 	if err != nil {
 		return newErrResult(err)
 	}
+	if attempts > 1 {
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"do: pick() returned","slot":%d,"picked_addr":"%s","attempt":%d,"is_replica":%t}`,
+			cmd.Slot(), cc.Addr(), attempts, c.toReplica(cmd))
+	}
 	resp = cc.Do(ctx, cmd)
 	if resp.NonRedisError() == errConnExpired {
 		goto retry
@@ -550,7 +752,11 @@ process:
 	switch addr, mode := c.shouldRefreshRetry(resp.Error(), ctx); mode {
 	case RedirectMove:
 		redirects++
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"do: MOVED redirect","slot":%d,"target":"%s","prev_addr":"%s","redirect_count":%d,"attempt":%d,"err":"%v"}`,
+			cmd.Slot(), addr, cc.Addr(), redirects, attempts, resp.Error())
 		if c.opt.ClusterOption.MaxMovedRedirections > 0 && redirects > c.opt.ClusterOption.MaxMovedRedirections {
+			rlog(`{"level":"ERROR","logger":"rueidis","msg":"do: max MOVED redirections exceeded","slot":%d,"redirects":%d,"max":%d}`,
+				cmd.Slot(), redirects, c.opt.ClusterOption.MaxMovedRedirections)
 			return resp
 		}
 		ncc := c.redirectOrNew(addr, cc, cmd.Slot(), mode)
@@ -562,6 +768,8 @@ process:
 		goto process
 	case RedirectAsk:
 		redirects++
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"do: ASK redirect","slot":%d,"target":"%s","prev_addr":"%s","redirect_count":%d,"attempt":%d}`,
+			cmd.Slot(), addr, cc.Addr(), redirects, attempts)
 		if c.opt.ClusterOption.MaxMovedRedirections > 0 && redirects > c.opt.ClusterOption.MaxMovedRedirections {
 			return resp
 		}
@@ -575,6 +783,8 @@ process:
 		resultsp.Put(results)
 		goto process
 	case RedirectRetry:
+		rlog(`{"level":"INFO","logger":"rueidis","msg":"do: RedirectRetry","slot":%d,"attempt":%d,"err":"%v","ctx_err":"%v"}`,
+			cmd.Slot(), attempts, resp.Error(), ctx.Err())
 		if c.retry && cmd.IsRetryable() {
 			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, resp.Error())
 			if shouldRetry {
@@ -1409,16 +1619,35 @@ func (c *clusterClient) Close() {
 
 func (c *clusterClient) shouldRefreshRetry(err error, ctx context.Context) (addr string, mode RedirectMode) {
 	if err != nil && err != Nil && err != ErrDoCacheAborted && atomic.LoadUint32(&c.stop) == 0 {
-		if err, ok := err.(*RedisError); ok {
-			if addr, ok = err.IsMoved(); ok {
-				mode = RedirectMove
-			} else if addr, ok = err.IsAsk(); ok {
-				mode = RedirectAsk
-			} else if err.IsClusterDown() || err.IsTryAgain() || err.IsLoading() {
+		if redisErr, ok := err.(*RedisError); ok {
+			if addr, ok = redisErr.IsMoved(); ok {
+				if !isValidRedisAddr(addr) {
+					mode = RedirectRetry
+					rlog(`{"level":"WARN","logger":"rueidis","msg":"shouldRefreshRetry: MOVED to invalid addr, using RedirectRetry instead of RedirectMove","addr":"%s"}`, addr)
+				} else {
+					mode = RedirectMove
+					rlog(`{"level":"INFO","logger":"rueidis","msg":"shouldRefreshRetry: MOVED","addr":"%s","valid_addr":true}`, addr)
+				}
+			} else if addr, ok = redisErr.IsAsk(); ok {
+				if !isValidRedisAddr(addr) {
+					mode = RedirectRetry
+					rlog(`{"level":"WARN","logger":"rueidis","msg":"shouldRefreshRetry: ASK to invalid addr, using RedirectRetry instead of RedirectAsk","addr":"%s"}`, addr)
+				} else {
+					mode = RedirectAsk
+					rlog(`{"level":"INFO","logger":"rueidis","msg":"shouldRefreshRetry: ASK","addr":"%s","valid_addr":true}`, addr)
+				}
+			} else if redisErr.IsClusterDown() || redisErr.IsTryAgain() || redisErr.IsLoading() {
 				mode = RedirectRetry
+				rlog(`{"level":"WARN","logger":"rueidis","msg":"shouldRefreshRetry: cluster error","err":"%s","is_down":%t,"is_tryagain":%t,"is_loading":%t}`,
+					redisErr.Error(), redisErr.IsClusterDown(), redisErr.IsTryAgain(), redisErr.IsLoading())
 			}
 		} else if ctx.Err() == nil {
 			mode = RedirectRetry
+			rlog(`{"level":"WARN","logger":"rueidis","msg":"shouldRefreshRetry: non-redis error, retrying","err":"%v","ctx_err":"%v"}`,
+				err, ctx.Err())
+		} else {
+			rlog(`{"level":"WARN","logger":"rueidis","msg":"shouldRefreshRetry: non-redis error with ctx done","err":"%v","ctx_err":"%v"}`,
+				err, ctx.Err())
 		}
 		if mode != RedirectNone {
 			c.lazyRefresh()

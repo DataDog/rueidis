@@ -151,7 +151,7 @@ var singleSlotResp = newResult(slicemsg('*', []RedisMessage{
 var singleSlotResp2 = newResult(slicemsg('*', []RedisMessage{
 	slicemsg('*', []RedisMessage{
 		{typ: ':', intlen: 0},
-		{typ: ':', intlen: 0},
+		{typ: ':', intlen: 16383},
 		slicemsg('*', []RedisMessage{ // master
 			strmsg('+', "127.0.3.1"),
 			{typ: ':', intlen: 3},
@@ -532,7 +532,7 @@ var singleShardResp2 = newResult(slicemsg('*', []RedisMessage{
 		strmsg(typeBlobString, "slots"),
 		slicemsg(typeArray, []RedisMessage{
 			strmsg(typeBlobString, "0"),
-			strmsg(typeBlobString, "0"),
+			strmsg(typeBlobString, "16383"),
 		}),
 		strmsg(typeBlobString, "nodes"),
 		slicemsg(typeArray, []RedisMessage{
