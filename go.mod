@@ -2,7 +2,7 @@ module github.com/redis/rueidis
 
 go 1.24.9
 
-toolchain go1.24.11
+toolchain go1.26.2
 
 require (
 	github.com/onsi/gomega v1.38.3
