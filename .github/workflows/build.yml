@@ -90,6 +90,7 @@ jobs:
           fi
 
       - name: Upload coverage to Datadog
+        if: env.DATADOG_API_KEY != ''
         env:
           DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
-        run: npx --yes @datadog/datadog-ci coverage upload --service rueidis coverage.out
+        run: npx --yes @datadog/datadog-ci coverage upload --format go coverage.out
