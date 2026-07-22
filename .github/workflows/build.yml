@@ -89,7 +89,8 @@ jobs:
             done
           fi
 
-      - uses: codecov/codecov-action@v5.4.2
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
+      - name: Upload coverage to Datadog
+        if: env.DATADOG_API_KEY != ''
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: npx --yes @datadog/datadog-ci coverage upload --format go coverage.out
